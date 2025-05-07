@@ -1,0 +1,247 @@
+---
+title: "Ranking MEPs for Nature Restoration Law"
+output: html_document
+date: "2023-04-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+source("https://www.dropbox.com/s/lzdnoe69iex1le1/load_packages.R?dl=1") #Load packages
+
+load_packages("lubridate",
+              "tidyverse",
+              "readxl",
+              "openxlsx",
+              "janitor",
+              "vroom",
+              "stringi",
+              "kableExtra")
+
+```
+
+```{r}
+
+data <- read.xlsx ("data/raw/ranking_data.xlsx", sheet = 2) %>%
+  fill (c(text_code, amendment_code), .direction = "down") %>%
+  mutate_at (c("gue_ngl", "verts_ale", "sd", "renew", "ppe", "ecr", "id", "ni"), strsplit, split = ",") %>%
+  pivot_longer (cols = c("gue_ngl", "verts_ale", "sd", "renew", "ppe", "ecr", "id", "ni"), names_to = "political_party") %>% 
+  unnest (value) %>%
+  rename (mep = value) %>%
+  mutate (mep = stri_trans_nfc(str_trim(mep))) %>% # normalize unicode strings
+  left_join (read.xlsx ("data/raw/ranking_data.xlsx", sheet = 1), by = c("text_code", "amendment_code", "vote")) %>%
+  relocate (c("text", "amendment", "theme","date"), .before = text_code) %>%
+  mutate (date = as.Date(date, origin = "1899-12-30")) %>%
+  filter (!is.na(mep))
+  
+
+```
+
+A given MEP can change political party
+
+```{r}
+
+mep_duplicated <- data %>%
+    distinct (mep, political_party) %>%
+    filter(duplicated (mep) == TRUE) %>%
+    select (mep) %>%
+    arrange (mep)
+
+data <- data %>% 
+  mutate (political_party = ifelse (mep %in% c(mep_duplicated %>% 
+                                          pull (mep)), "change_over_time", political_party))
+
+rm (mep_duplicated)
+
+```
+
+We add the nationality 
+
+```{r}
+
+data <- data %>%
+  left_join (read.xlsx("data/processed/mep_country.xlsx"), by = "mep") %>%
+  relocate(c("mep", "political_party", "country", "vote", "score"), .after = "amendment_code")
+
+```
+
+Now, we rank the MEPs
+
+```{r}
+
+vote_date <- read.xlsx ("data/raw/ranking_data.xlsx", sheet = 1) %>% 
+  distinct (amendment, date) %>% 
+  mutate(date = as.Date(date, origin = "1899-12-30"))
+
+ranking_all <- data %>%
+  with_groups (c(mep, political_party, country), summarise, score = sum (score)) %>%
+  arrange (desc(score)) %>%
+  left_join(read.xlsx("data/raw/mandate_periods.xlsx"), by = "mep") %>%
+  mutate_at(c("mandate_start", "mandate_end"), ~as.Date(., origin = "1899-12-30")) %>%
+  mutate(mandate_start = if_else(is.na(mandate_start), ymd("2019-07-02"), mandate_start)) %>%
+  mutate(mandate_end = if_else(is.na(mandate_end), ymd("2023-06-01"), mandate_end)) %>% #FLM : a remplacé par if_else plutôt que ifelse, qui ne fonctionne pas avec les dates. Ca évite de rajouter encore un mutate après
+  # mutate_at(c("mandate_start", "mandate_end"), ~as.Date(., origin = "1970-01-01")) %>%
+  rowwise () %>% 
+  mutate(amendment_voted = length(which(vote_date %>% pull (date) %within% interval(mandate_start, mandate_end)))) %>% # we calculate the number of votes in which the MEPs took part, because some MEP arrived or left the parliament over the course of the legislature
+  mutate (score_norm = round((score-(-amendment_voted))/(amendment_voted-(-amendment_voted))*20, 1)) %>% # we calibrate each MEP score to range from 0 to 20
+  ungroup () %>%
+  mutate(amendment_voted_perc = round(amendment_voted*100/20, 0)) %>%
+  relocate(amendment_voted_perc, .after= amendment_voted) %>%
+  filter (!country == "United Kingdom") # we remove the British, very imp because i did not add their mandature date end so their score is calculated as if they have voted all the texts
+
+write.xlsx (ranking_all, "output/ranking_all.xlsx")
+
+```
+
+Let's calculate the mean score for each political group
+
+```{r}
+
+ranking_all %>%
+  with_groups (political_party, summarise, score_mean = round(mean(score_norm), 1)) %>%
+  arrange(desc(score_mean)) %>%
+  kable ()
+
+```
+
+
+Filter the data to get only MEPs in ENVI commission
+
+```{r}
+
+ranking_envi <- data %>%
+  rename (last_name = mep) %>%
+  filter (last_name %in% c(read.xlsx ("data/raw/mep_envi_2023.xlsx") %>% # we filter the total list of MEPs to keep only MEP siting in ENVI committee
+                       pull (last_name))) %>%
+  with_groups (c(last_name, political_party, country), summarise, score = sum (score)) %>%
+  arrange (last_name) %>%
+  left_join(read.xlsx("data/raw/mandate_periods.xlsx") %>% # we take into account the start and end dates of their mandate in the calculation of their score. Some deputies arrived during the legislature to replace deputies who had begun a mandate in their own country or who had left the parliament because of Brexit. For these MEPs, only the texts passed during their term of office were considered for the calculation of the score
+              rename(last_name = mep), by = "last_name") %>%
+  mutate_at(c("mandate_start", "mandate_end"), ~as.Date(., origin = "1899-12-30")) %>%
+  mutate(mandate_start = if_else(is.na(mandate_start), ymd("2019-07-02"), mandate_start)) %>%
+  mutate(mandate_end = if_else(is.na(mandate_end), ymd("2023-06-01"), mandate_end)) %>%
+  # mutate_at(c("mandate_start", "mandate_end"), ~as.Date(., origin = "1970-01-01")) %>%
+  rowwise () %>% 
+  mutate(amendment_voted = length(which(vote_date %>% pull (date) %within% interval(mandate_start, mandate_end)))) %>%
+  mutate (score_norm = round((score-(-amendment_voted))/(amendment_voted-(-amendment_voted))*20, 1)) %>%
+  ungroup () %>% 
+  left_join (read.xlsx ("data/raw/mep_envi_2023.xlsx") %>% # we add each MEP metadata (eg., national party, status in ENVI committee, etc.)
+               select (-commission), by = "last_name") %>%
+  select(-political_party) %>%
+  rowwise () %>%
+  mutate (last_name = ifelse (grepl(first_name, last_name), str_remove (last_name, paste0 (" ", first_name)), last_name)) %>% #when a last name is shared by several MEP, its first name is also indicated in its last name column ; to correct this we delete the first name in the last name column
+  select (last_name, first_name, country, eu_party, national_party, status, amendment_voted, score, score_norm)
+
+write.xlsx(ranking_envi, "output/ranking_envi.xlsx")
+
+```
+
+A few MEPs present in the ENVI committee did not vote the texts we selected for our analysis because they arrived very recently at the parliament.
+
+```{r}
+
+read.xlsx ("data/raw/mep_envi_2023.xlsx") %>%
+  rowwise () %>%
+  mutate (last_name = ifelse (grepl(first_name, last_name), str_remove (last_name, paste0 (" ", first_name)), last_name)) %>%
+  select (last_name) %>%
+  left_join(ranking_envi %>%
+              select(last_name) %>%
+              mutate(match = T), by ="last_name") %>%
+  filter(is.na(match))
+
+```
+
+We create a table with the detail of each vote for MEP in ENVI commission
+
+```{r}
+
+text_order <- c("momentum for the ocean_amendment 4/3",	"momentum for the ocean_paragraph 6", "fisheries control system_amendment 81", "fisheries control system_amendment 328/1", "sustainable blue economy_amendment 1", "sustainable blue economy_amendment 3", "sustainable blue economy_amendment 4", "taxonomy_whole text", "just transition fund_amendment 45/1", "the new common agricultural policy_amendment 1147", "the new common agricultural policy_amendment 1141", "resolution uganda and tanzania_paragraph 5", "the project of common interests_whole text", "the european climate law_amendment 48/2_100PC1", "resolution cop15_amendment 5/2", "resolution cop15_amendment 18", "resolution cop15_amendment 19", "eu biodiversity strategy for 2030_amendment 22", "eu biodiversity strategy for 2030_paragraph 74.2", "eu biodiversity strategy for 2030_paragraph 174.2")
+
+write.xlsx(data %>%
+             rename(last_name = mep) %>%
+             mutate(text = paste0(text, "_", amendment)) %>%
+             select(text, last_name, date, score) %>%
+             complete (text, last_name) %>% # we expand the tibble to include all possible combinations of text vs. mep values. It will create rows with the score column filled with NA for texts that were not voted by MEPs due to either absence or the fact that the MEP was out of mandate.
+             with_groups (text, fill, date, .direction = "downup") %>%
+             left_join(read.xlsx("data/raw/mandate_periods.xlsx") %>%
+                         rename(last_name = mep), by = "last_name") %>%
+             mutate_at(c("mandate_start", "mandate_end"), ~as.Date(., origin = "1899-12-30")) %>%
+             mutate(mandate_start = if_else(is.na(mandate_start), ymd("2019-07-02"), mandate_start)) %>%
+             mutate(mandate_end = if_else(is.na(mandate_end), ymd("2023-06-01"), mandate_end)) %>%
+             # mutate_at(c("mandate_start", "mandate_end"), ~as.Date(., origin = "1970-01-01")) %>%
+             rowwise () %>%
+             mutate(mandate = date %within% interval (mandate_start, mandate_end)) %>%
+             ungroup () %>%
+             mutate(score = ifelse(mandate == FALSE, "no mandate", score)) %>% # we want to differentiate the absence of vote due to real absence or because the deputy had not yet taken up his/her mandate
+             select(-mandate) %>%
+             select(text, last_name, score) %>%
+             mutate(text = factor(text, levels = text_order)) %>%
+             arrange(text) %>%
+             pivot_wider (names_from = text, values_from = score) %>%
+             filter (last_name %in% c(read.xlsx ("data/raw/mep_envi_2023.xlsx") %>% 
+                                        pull (last_name))) %>%
+             left_join (read.xlsx ("data/raw/mep_envi_2023.xlsx") %>%
+                          select (-commission), by = "last_name") %>%
+             relocate (first_name:status, .after = last_name) %>%
+             rowwise () %>%
+             mutate (last_name = ifelse (grepl(first_name, last_name), str_remove (last_name, paste0 (" ", first_name)), last_name)) %>%
+             select (-eu_party:-status) %>%
+             arrange (last_name), "output/envi_detailed_scores.xlsx")
+
+```
+
+Let's create plot that show the dispersal of the score for each political group in ENVI Committee
+
+```{r}
+
+# We first prepare the data before ploting 
+
+data_plot_1 <- tibble (group = c("Greens/EFA", "GUE/NGL", "S&D", "Renew", "NI", "ID", "EPP", "ECR"),
+        seat = c(20, 11, 35, 24, 8, 15, 42, 16),
+        score = c(19, 17.8, 16.4, 11.9, 11.4, 3.54, 3.43, 2.98)) %>%
+  mutate (seat_cum = cumsum(seat),
+          seat_lag = lag(seat_cum)) %>%
+  mutate(seat_lag = ifelse(is.na(seat_lag), 0, seat_lag)) %>%
+  mutate(seat_cum = seat_cum - 0.25,
+         seat_lag = seat_lag + 0.25) %>%
+  rowwise () %>%
+  mutate(seat_mean = (seat_lag + seat_cum)/2) %>%
+  ungroup () %>%
+  relocate(seat_lag, .before = seat_cum)
+
+data_plot_2 <- ranking_envi %>%
+    select (eu_party, score_norm) %>%
+  mutate(eu_party = ifelse(eu_party == "SD", "S&D", eu_party)) %>%
+  mutate(score_norm = round(score_norm, 0)) %>%
+  with_groups (c("eu_party", "score_norm"), summarise, count = n()) %>%
+  mutate(x = case_when(eu_party == "Greens/EFA" ~ 10,
+                         eu_party == "GUE/NGL" ~ 25.5,
+                         eu_party == "S&D" ~ 48.5,
+                         eu_party == "Renew" ~ 78, 
+                         eu_party == "NI" ~ 94,
+                         eu_party == "ID" ~ 105.5, 
+                         eu_party == "EPP" ~ 134, 
+                         eu_party == "ECR" ~ 163)) 
+
+```
+
+We create the plot 
+
+```{r}
+
+ggplot () +
+    geom_rect (data = data_plot_1, aes(xmin = seat_lag, xmax = seat_cum, ymin = -4, ymax = 0)) +
+    geom_point (data = data_plot_2, aes(x=x, y=score_norm, size = count)) +
+  geom_text (data = data_plot_1, aes(label = group, x = seat_mean, y = -2), color = "grey100", size = 2.5) +
+  theme_minimal () +
+  labs(y = "Note", x = "Nombre de sièges")
+
+
+ggsave ("fig_ranking_nrl_2.pdf", path = "output/", width = 21, height = 17, unit = "cm")
+  
+
+```
+
